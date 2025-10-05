@@ -340,6 +340,7 @@ latent_vector = torch.nn.ModuleList([LatentFieldWithKeypoints(latent_dim=latent_
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+#use pretrained VAE 
 checkpoint = torch.load("vae_pretrained.pt", map_location=device)
 generator.load_state_dict(checkpoint)
 for param in generator.encoder.parameters():
