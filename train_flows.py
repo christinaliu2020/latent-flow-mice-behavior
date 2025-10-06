@@ -13,6 +13,72 @@ from dataset import VideoDataset, VideoDatasetWithKeypoints
 import gc
 import torch.nn.functional as F
 
+def log_latent_traversals(generator, latent_vector, z, epoch, num_vector, every_k_epochs=5):
+    """
+    Logs per-flow latent traversals for the first sample in batch.
+    """
+    if epoch % every_k_epochs != 0:
+        return
+    z_base = z[:1]                                # visualize one sample
+    traversal_steps = [0, 1, 2, 3, 4, 5]
+    for k in range(num_vector):
+        recon_images = []
+        for alpha in traversal_steps:
+            delta_k = latent_vector[k](z_base)
+            z_trav  = z_base + alpha * delta_k
+            with torch.no_grad():
+                recon = generator.inference(z_trav)  # [1,3,H,W]
+            recon_images.append(recon[0].cpu())
+
+        fig, axes = plt.subplots(1, len(traversal_steps), figsize=(3*len(traversal_steps), 3))
+        for j, img in enumerate(recon_images):
+            img = img.clamp(0, 1)
+            axes[j].imshow(img.permute(1, 2, 0).numpy())
+            axes[j].axis("off")
+            axes[j].set_title(f"α={traversal_steps[j]}")
+        plt.suptitle(f"Latent Traversal | Flow {k} | Epoch {epoch}")
+        plt.tight_layout()
+        wandb.log({f"Train_Latent_Traversal/Flow_{k}_Epoch_{epoch}": wandb.Image(fig)})
+        plt.close(fig)
+
+
+def log_t_series_panel(plot_targets, plot_preds, y_all, epoch, iteration, max_samples=6, every_k_epochs=5):
+    """
+    Logs a 2-row panel (GT vs Pred) over T timesteps for up to max_samples from the first batch.
+    Includes hard/soft y in the title of the first column.
+    """
+    if epoch % every_k_epochs != 0:
+        return
+    if len(plot_targets) == 0:
+        return
+
+    T = len(plot_targets)
+    Kshow = min(max_samples, plot_targets[0].size(0))
+    for sample_idx in range(Kshow):
+        fig, axes = plt.subplots(2, T, figsize=(3*T, 6))
+        axes = np.atleast_2d(axes)
+        for t in range(T):
+            target = plot_targets[t][sample_idx].permute(1, 2, 0).numpy()
+            pred   = plot_preds[t][sample_idx].permute(1, 2, 0).numpy()
+
+            axes[0, t].imshow(np.clip(target, 0, 1)); axes[0, t].axis("off")
+            axes[1, t].imshow(np.clip(pred,   0, 1)); axes[1, t].axis("off")
+
+            # show hard/soft y on first column
+            if t == 0 and t < len(y_all):
+                y_vec = y_all[t][sample_idx]  # [K]
+                chosen = torch.argmax(y_vec).item()
+                one_hot = [1 if k == chosen else 0 for k in range(len(y_vec))]
+                y_vec_str_hard = " ".join(map(str, one_hot))
+                y_vec_str_soft = " ".join([f"{val:.2f}" for val in y_vec.tolist()])
+                axes[0, t].set_title("GT")
+                axes[1, t].set_title(f"Pred\ny=[{y_vec_str_hard}] (hard)\ny=[{y_vec_str_soft}] (soft)")
+
+        plt.suptitle(f"Train t-series | Sample {sample_idx} | Epoch {epoch} Iter {iteration}")
+        plt.tight_layout()
+        wandb.log({f"Train t-series Sample {sample_idx} (E{epoch})": wandb.Image(fig)})
+        plt.close(fig)
+
 def training_function(data_loader, optimizer_spike, optimizer_full, generator, reconstructor, latent_vector,
                       num_steps, num_vector, epoch, total_epochs, print_freq=10,
                       device='cuda', stage_transition_iter=20000, global_step_tracker=None):
@@ -33,50 +99,35 @@ def training_function(data_loader, optimizer_spike, optimizer_full, generator, r
         seq = seq.to(device)
         context_chunk = context_chunk.to(device)
         kp_seq = kp_seq.to(device)
+
+        #encode first frame
         x0 = seq[:, 0]
         kp0 = kp_seq[:, 0]
         recon_x0, mu0, logvar0, z = generator(x0)
-        if i == 0 and epoch % 5 == 0:
-            z_base = z[:1]  #  visualize one sample
-            x_base = x0[:1] # original image
-            traversal_steps = [0, 1, 2, 3, 4, 5]
-            for k in range(num_vector):
-                recon_images = []
-                for alpha in traversal_steps:
-                    delta_k = latent_vector[k](z_base)
-                    z_trav = z_base + alpha * delta_k
-                    with torch.no_grad():                  
-                        recon = generator.inference(z_trav) # [1, 3, H, W]
-                    recon_images.append(recon[0].cpu())
-
-                # Plot all traversals for this flow
-                fig, axes = plt.subplots(1, len(traversal_steps), figsize=(3*len(traversal_steps), 3))
-                for j, img in enumerate(recon_images):
-                    img = img.clamp(0, 1)
-                    axes[j].imshow(img.permute(1, 2, 0).numpy())
-                    axes[j].axis("off")
-                    axes[j].set_title(f"α={traversal_steps[j]}")
-                plt.suptitle(f"Latent Traversal | Flow {k} | Epoch {epoch}")
-                plt.tight_layout()
-                wandb.log({f"Train_Latent_Traversal/Flow_{k}_Epoch_{epoch}": wandb.Image(fig)})
-                plt.close(fig)
-
         vae_loss = vgg_vae_loss_fn(recon_x0, x0)
 
+        #latent traversal(for visualization)
+        if i == 0:
+            log_latent_traversals(generator, latent_vector, z, epoch, num_vector, every_k_epochs=5)
+
+
         init_switch_prob = 0.3
-        rej_prob = 1. / num_vector + 2 * init_switch_prob * (1 - init_switch_prob) * 1. / num_vector + (init_switch_prob**2) * 1. / num_vector
+        rej_prob = (1. / num_vector 
+                    + 2 * init_switch_prob * (1 - init_switch_prob) * 1. / num_vector 
+                    + (init_switch_prob**2) * 1. / num_vector)
         intial_prob = rej_prob
         target_prob = 0.0
+
         x_t1 = x0
         kp_t1 = kp0
-        plot_targets = []
-        plot_preds = []
+        plot_targets, plot_preds, y_all = [], [], []
         for t in range(1, num_steps + 1):
             x_t = x_t1.clone()
             x_t1 = seq[:, t]
             kp_t1 = kp_seq[:, t]
             x_pair = torch.cat([x_t, x_t1, x_t1-x_t], dim=1)
-            y, g = reconstructor(x_t, iteration)
+            y, g = reconstructor(x_pair, iteration)
+            y_all.append(y)
             flow_usage = y.mean(dim=0)  # average across batch
             uz = 0.0
             recon_per_flow = []   
@@ -98,47 +149,40 @@ def training_function(data_loader, optimizer_spike, optimizer_full, generator, r
 
 
             #perceptual loss for encouraging diversity
-            diversity_loss = 0.0
-            for k in range(num_vector):
-                for j in range(k+1, num_vector):
-                    feat_i = percep_loss_fn.extract_features(recon_per_flow[k].detach())
-                    feat_j = percep_loss_fn.extract_features(recon_per_flow[j].detach())
-                    diversity_loss += (1 - F.cosine_similarity(
-                        feat_i.flatten(1), feat_j.flatten(1)
-                    ).mean())
-
-            # normalize + weight
             if num_vector > 1:
-                diversity_loss = diversity_loss / (num_vector * (num_vector-1) / 2)
-                vae_loss += diversity_loss
-                
+                diversity_loss = 0.0
+                for k in range(num_vector):
+                    for j in range(k + 1, num_vector):
+                        feat_i = percep_loss_fn.extract_features(recon_per_flow[k].detach())
+                        feat_j = percep_loss_fn.extract_features(recon_per_flow[j].detach())
+                        diversity_loss += (1 - F.cosine_similarity(
+                            feat_i.flatten(1), feat_j.flatten(1)
+                        ).mean())
+                diversity_loss = diversity_loss / (num_vector * (num_vector - 1) / 2)
+                # normalize + weight
+                vae_loss += 1.0 * diversity_loss
+
             #use entropy loss term when hard = False
             # entropy = -(y * (y + 1e-8).log()).sum(dim=1).mean()
             # entropy_loss = -0.01 * entropy   # λ_entropy = 0.01 (tune this)
             # vae_loss += entropy_loss
+
             if i == 0:
                 # Store targets and predictions for first batch only
                 plot_targets.append(x_t1.detach().cpu())     # shape: [B, 3, H, W]
                 plot_preds.append(pred_t1.detach().cpu())    # shape: [B, 3, H, W]
-            if t == 1:
-                y_all = [y]
-            else:
-                y_all.append(y)
-            if t == 1:
-                y_set = y
-            else:
-                y_set = torch.cat([y_set, y], dim=0)
 
             target_prob = target_prob + intial_prob
             intial_prob = (intial_prob * (1-init_switch_prob) + (1 - intial_prob) * init_switch_prob) + torch_binom(
                 torch.FloatTensor([3.]).to(z),
                 torch.FloatTensor([intial_prob * 3]).to(z)
-            ) * (init_switch_prob ** (intial_prob * 3)) * ((1-init_switch_prob) ** (3 - intial_prob * 3)) * (
+                ) * (init_switch_prob ** (intial_prob * 3)) * ((1-init_switch_prob) ** (3 - intial_prob * 3)) * (
                  1. / num_vector + 2 * init_switch_prob * (1 - init_switch_prob) * 
                  1. / num_vector + (init_switch_prob**2) * 1. / num_vector)
 
         #categorical KL
         #flow_usage = y_set.mean(dim=(0, 1))
+        y_set = torch.cat(y_all, dim=0)   # [T*B, K]
         flow_usage = y_set.mean(dim=0)
         uniform_target = torch.full_like(flow_usage, 1.0 / num_vector)
         kl_flow = torch.nn.functional.kl_div((flow_usage + 1e-8).log(), uniform_target, reduction='batchmean')
@@ -149,42 +193,8 @@ def training_function(data_loader, optimizer_spike, optimizer_full, generator, r
         total_loss += loss.item()
         final_latent_codes.append(z.detach().cpu())
 
-        if epoch % 5 == 0 and i == 0:
-            with torch.no_grad():
-                T = len(plot_targets)  # num time steps
-                K = min(6, plot_targets[0].size(0))  # batch size
-
-                for sample_idx in range(K):
-                    fig, axes = plt.subplots(2, T, figsize=(3*T, 6))
-                    axes = np.atleast_2d(axes)
-
-                    #spike_vecs = []
-                    for t in range(T):
-                        target = plot_targets[t][sample_idx].permute(1,2,0).numpy()
-                        pred = plot_preds[t][sample_idx].permute(1,2,0).numpy()
-
-                        axes[0, t].imshow(np.clip(target, 0, 1))
-                        axes[0, t].axis("off")
-                        axes[1, t].imshow(np.clip(pred, 0, 1))
-                        axes[1, t].axis("off")
-
-                        # Get spike vector as string like "y=[1 0 0]"
-                        y_vec = y_all[t][sample_idx]  # shape: [num_flows]
-                        chosen = torch.argmax(y_vec).item()
-                        one_hot = [1 if k == chosen else 0 for k in range(len(y_vec))]
-                        y_vec_str_hard = " ".join(map(str, one_hot))
-                        y_vec_str_soft = " ".join([f"{val:.2f}" for val in y_vec.tolist()])
-
-                        if t == 0:
-                            axes[0, t].set_title("GT")
-                            axes[1, t].set_title(f"Pred\ny=[{y_vec_str_hard}] (hard) \ny=[{y_vec_str_soft}] (soft)")
-
-                        #spike_vecs.append(y_vec_str)
-
-                    plt.suptitle(f"Sample {sample_idx} | Epoch {epoch} Iter {iteration}")
-                    plt.tight_layout()
-                    wandb.log({f"Train t-series Sample {sample_idx} (E{epoch})": wandb.Image(fig)})
-                    plt.close(fig)
+        if i == 0:
+            log_t_series_panel(plot_targets, plot_preds, y_all, epoch, iteration, max_samples=6, every_k_epochs=5)
         if iteration % print_freq == 0:
             wandb.log({"Train Loss": loss.item(), "Iteration": iteration, "Epoch": epoch})
             print(f"Epoch [{epoch}/{total_epochs}], Iteration {iteration}: Loss = {loss.item():.4f}")
@@ -198,13 +208,50 @@ def training_function(data_loader, optimizer_spike, optimizer_full, generator, r
     avg_loss = total_loss / len(data_loader)
     wandb.log({"Epoch Average Loss": avg_loss, "Epoch": epoch})
 
-    final_latent_codes_tensor = torch.cat(final_latent_codes, dim=0)
-    os.makedirs("latent_codes", exist_ok=True)
+    #final_latent_codes_tensor = torch.cat(final_latent_codes, dim=0)
+    #os.makedirs("latent_codes", exist_ok=True)
     #torch.save(final_latent_codes_tensor, f"latent_codes/final_latent_codes_epoch_{epoch}.pt")
     del x0, x_t, x_t1, z, pred_t1, uz, y, g, delta
     torch.cuda.empty_cache()
     gc.collect()
     return avg_loss
+
+def log_val_latent_traversals(
+    generator,
+    latent_vector,
+    z_batch,
+    epoch: int,
+    num_vector: int,
+    alphas: torch.Tensor,
+    stage_tag: str,
+    num_samples_to_log: int = 6,
+):
+    """
+    Logs per-flow latent traversal grids for a few samples from the current batch.
+    - z_batch: [B, D]
+    - alphas: 1D tensor of traversal coefficients (e.g., torch.linspace(0,10,9))
+    """
+    B = z_batch.size(0)
+    idxs = torch.randperm(B)[:num_samples_to_log].tolist()
+
+    for sample_idx in idxs:
+        z0 = z_batch[sample_idx:sample_idx + 1]
+
+        fig, axes = plt.subplots(num_vector, len(alphas), figsize=(3 * len(alphas), 3 * num_vector))
+        for fidx in range(num_vector):
+            delta = latent_vector[fidx](z0)
+            for j, a in enumerate(alphas):
+                z_mod = z0 if float(a) == 0.0 else z0 + a * delta
+                img = generator.inference(z_mod)
+                axes[fidx, j].imshow(img.squeeze(0).permute(1, 2, 0).cpu().numpy())
+                axes[fidx, j].axis("off")
+            axes[fidx, 0].set_ylabel(f"Flow {fidx}", fontsize=12)
+
+        plt.suptitle(f"Val Traversal (Epoch {epoch}) [{stage_tag}] sample {sample_idx}")
+        plt.tight_layout()
+        wandb.log({f"Val Traversal sample {sample_idx}": wandb.Image(fig)})
+        plt.close(fig)
+
 
 def validation_function(
     data_loader,
@@ -251,7 +298,7 @@ def validation_function(
 
             x_pair = torch.cat([x_t, x_t1, x_t1 - x_t], dim=1)
 
-            y, g = reconstructor(x_t, iter=None)
+            y, g = reconstructor(x_pair, iter=None)
 
             uz = 0.0
             for idx in range(num_vector):
@@ -273,36 +320,24 @@ def validation_function(
         num_batches += 1
 
         if epoch % 5 == 0 and i == 0:
-            bs = x0.size(0)
-            idxs = torch.randperm(bs)[:num_samples_to_log].tolist()
-            stage_tag = "spike+slab" if not spike_only else "spike"
-
-            for sample_idx in idxs:
-                z0 = z[sample_idx:sample_idx+1]
-
-                fig, axes = plt.subplots(num_vector, len(alphas),
-                                            figsize=(3*len(alphas), 3*num_vector))
-                for fidx in range(num_vector):
-                    delta = latent_vector[fidx](z0)
-                    for j, a in enumerate(alphas):
-                        z_mod = z0 if a == 0 else z0 + a * delta
-                        with torch.no_grad():
-                            img = generator.inference(z_mod)
-                        axes[fidx, j].imshow(img.squeeze(0).permute(1, 2, 0).cpu().numpy())
-                        axes[fidx, j].axis("off")
-                    axes[fidx, 0].set_ylabel(f"Flow {fidx}", fontsize=12)
-                plt.suptitle(f"Val Traversal (Epoch {epoch}) [{stage_tag}] sample {sample_idx}")
-                plt.tight_layout()
-                wandb.log({f"Val Traversal sample {sample_idx}": wandb.Image(fig)})
-                plt.close(fig)
-
+            stage_tag = "spike" if spike_only else "spike+slab"
+            log_val_latent_traversals(
+                generator=generator,
+                latent_vector=latent_vector,
+                z_batch=z,
+                epoch=epoch,
+                num_vector=num_vector,
+                alphas=alphas,
+                stage_tag=stage_tag,
+                num_samples_to_log=6,
+            )
         break  # one batch for validation
 
     avg_loss = total_loss / max(num_batches, 1)
     wandb.log({
         "Validation Loss": avg_loss,
         "Epoch": epoch,
-        "Val Stage": "slab" if not spike_only else "spike"
+        "Val Stage": "spike+slab" if not spike_only else "spike"
     })
     del x0, x_t, x_t1, z, pred_t1, uz, y, g, delta
     torch.cuda.empty_cache()
