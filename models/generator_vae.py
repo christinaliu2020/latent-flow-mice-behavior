@@ -145,16 +145,24 @@ class DinoUNetVAE(nn.Module):
         self.decoder = UNetDecoder(z_dim=embed_dim,img_size=img_size)
 
     def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        # std = torch.exp(0.5 * logvar)
+        # eps = torch.randn_like(std)
+        # return mu + eps * std
+        return mu 
 
+    # def forward(self, x):
+    #     mu, logvar = self.encoder(x)
+    #     z = self.reparameterize(mu, logvar)
+    #     recon = self.decoder(z)
+    #     return recon, mu, logvar, z
     def forward(self, x):
-        mu, logvar = self.encoder(x)
-        z = self.reparameterize(mu, logvar)
+        mu, _ = self.encoder(x)
+        z = mu
         recon = self.decoder(z)
+        logvar = torch.zeros_like(mu)
         return recon, mu, logvar, z
 
+    @torch.no_grad()
     def inference(self, z):
         return self.decoder(z)
     
